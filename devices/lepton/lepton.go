@@ -13,7 +13,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/golang/glog"
 	"periph.io/x/periph/conn"
+	"periph.io/x/periph/conn/gpio"
 	"periph.io/x/periph/conn/i2c"
 	"periph.io/x/periph/conn/physic"
 	"periph.io/x/periph/conn/spi"
@@ -71,19 +73,26 @@ func New(p spi.Port, i i2c.Bus) (*Dev, error) {
 		return nil, err
 	}
 	// TODO(maruel): Support Lepton 3 with 160x120.
-	w := 80
-	h := 60
-	// telemetry data is a 3 lines header.
-	frameLines := h + 3
-	frameWidth := w*2 + 4
+	var w, h int
+	var m vospiStateMachine
+	if v, err := c.GetVersion(); err != nil {
+		return nil, err
+	} else if v.Major == 2 {
+		w, h = 80, 60
+		m = &lepton2StateMachine{}
+	} else if v.Major == 3 {
+		w, h = 160, 120
+		m = &lepton3StateMachine{}
+	} else {
+		return nil, fmt.Errorf("unsupported version %s", v)
+	}
+	packetSize := 80*2 + 4
 	d := &Dev{
 		Dev:        c,
 		s:          s,
-		w:          w,
-		h:          h,
 		prevImg:    image14bit.NewGray14(image.Rect(0, 0, w, h)),
-		frameWidth: frameWidth,
-		frameLines: frameLines,
+		m:          m,
+		packetSize: packetSize,
 		delay:      time.Second,
 	}
 	if l, ok := s.(conn.Limits); ok {
@@ -108,15 +117,12 @@ func New(p spi.Port, i i2c.Bus) (*Dev, error) {
 // Lepton.
 type Dev struct {
 	*cci.Dev
-	s              spi.Conn
-	w              int
-	h              int
-	prevImg        *image14bit.Gray14
-	frameA, frameB []byte
-	frameWidth     int // in bytes
-	frameLines     int
-	maxTxSize      int
-	delay          time.Duration
+	s          spi.Conn
+	prevImg    *image14bit.Gray14
+	m          vospiStateMachine
+	packetSize int // in bytes
+	maxTxSize  int
+	delay      time.Duration
 }
 
 func (d *Dev) String() string {
@@ -131,7 +137,7 @@ func (d *Dev) Halt() error {
 
 // Bounds returns the device frame size.
 func (d *Dev) Bounds() image.Rectangle {
-	return image.Rect(0, 0, d.w, d.h)
+	return d.prevImg.Bounds()
 }
 
 // NextFrame blocks and returns the next frame from the camera.
@@ -170,24 +176,240 @@ func (d *Dev) NextFrame(f *Frame) error {
 func (d *Dev) stream(done <-chan struct{}, c chan<- []byte) error {
 	lines := 8
 	if d.maxTxSize != 0 {
-		if l := d.maxTxSize / d.frameWidth; l < lines {
+		if l := d.maxTxSize / d.packetSize; l < lines {
 			lines = l
 		}
 	}
 	for {
 		// TODO(maruel): Use a ring buffer to stop continuously allocating.
-		buf := make([]byte, d.frameWidth*lines)
+		buf := make([]byte, d.packetSize*lines)
 		if err := d.s.Tx(nil, buf); err != nil {
 			return err
 		}
-		for i := 0; i < len(buf); i += d.frameWidth {
+		for i := 0; i < len(buf); i += d.packetSize {
 			select {
 			case <-done:
 				return nil
-			case c <- buf[i : i+d.frameWidth]:
+			case c <- buf[i : i+d.packetSize]:
 			}
 		}
 	}
+}
+
+type vospiStateMachine interface {
+	// Reset resets the state machine to its start state.
+	Reset()
+	// Transition feeds one packet to the state machine, and returns if a frame is ready.
+	Transition(l []byte, f *Frame) bool
+}
+
+type lepton2StateMachine struct {
+	// The packet ID that should arrive next.
+	Packet int
+}
+
+func (m *lepton2StateMachine) Reset() {
+	m.Packet = 0
+}
+
+func (m *lepton2StateMachine) Transition(l []byte, f *Frame) bool {
+	h := internal.Big16.Uint16(l)
+	if h&packetHeaderDiscard == packetHeaderDiscard {
+		return false
+	}
+	if !verifyCRC(l) {
+		glog.V(3).Info("Bad CRC")
+		m.Reset()
+		return false
+	}
+	packetID := int(h & packetHeaderMask)
+	if packetID != m.Packet {
+		glog.V(3).Infof("packet out of sync: packet id %d, state %+v", packetID, *m)
+		m.Reset()
+		return false
+	}
+	if packetID == 0 {
+		// Parse the first row of telemetry data.
+		if err2 := f.Metadata.parseTelemetry(l[4:]); err2 != nil {
+			glog.V(3).Infof("Failed to parse telemetry line: %v", err2)
+			m.Reset()
+			return false
+		}
+	} else if 3 <= packetID && packetID < 63 {
+		// Image.
+		y := packetID - 3
+		glog.V(2).Infof("saving to (%d, %d)", 0, y)
+		for x := 0; x < 80; x++ {
+			o := 4 + x*2
+			f.SetIntensity14(x, y, image14bit.Intensity14(internal.Big16.Uint16(l[o:o+2])))
+		}
+	}
+
+	m.Packet++
+	if m.Packet == 62 {
+		m.Packet = 0
+		return true
+	}
+	return false
+}
+
+var _ vospiStateMachine = &lepton2StateMachine{}
+
+type syncStats struct {
+	numDiscard          int
+	numBadCRC           int
+	numPacketOutOfSync  int
+	numSegmentOutOfSync int
+	start               time.Time
+}
+
+type lepton3StateMachine struct {
+	// Options
+	TelemetryEnabled bool
+
+	// The previous segment ID. The segment ID that should arrive next is equal to LastSegment + 1.
+	LastSegment int
+	// The packet ID that should arrive next.
+	Packet int
+	Start  time.Time
+
+	Stats syncStats
+}
+
+func (m *lepton3StateMachine) Reset() {
+	m.ResetSync()
+	m.Stats = syncStats{}
+	m.Stats.start = time.Now()
+}
+
+func (m *lepton3StateMachine) ResetSync() {
+	m.LastSegment = 0
+	m.Packet = 0
+	m.Start = time.Now()
+}
+
+// var numBadCRC = 0
+
+func (m *lepton3StateMachine) Transition(l []byte, f *Frame) bool {
+	// m.Packet++
+	// if m.Packet == 244 {
+	// 	elapsed := time.Now().Sub(m.Start)
+	// 	glog.Infof("frame took %s, %g Mbps", elapsed, float64(244*164*8)/float64(elapsed.Microseconds()))
+	// 	return true
+	// }
+	// return false
+	h := internal.Big16.Uint16(l)
+	// ms := time.Now().Sub(m.Stats.start).Milliseconds()
+	// if ms > 1000 {
+	// 	glog.Infof("Extremely slow frame? stats: %+v, packet:\n", m.Stats, hex.Dump(l))
+	// } else if ms > 120 {
+	// 	glog.Infof("Slow frame? header: %04x, stats: %+v", h, m.Stats)
+	// }
+	if h&packetHeaderDiscard == packetHeaderDiscard {
+		m.Stats.numDiscard++
+		// glog.Info("discard")
+		return false
+	}
+	// if !verifyCRC(l) {
+	// 	// glog.V(3).Info("Bad CRC\n", hex.Dump(l))
+	// 	m.Stats.numBadCRC++
+	// 	// numBadCRC++
+	// 	// if numBadCRC >= 10000 {
+	// 	// 	glog.Fatal("Hit max numBadCRC")
+	// 	// }
+	// 	m.ResetSync()
+	// 	return false
+	// }
+	// if numBadCRC > 0 {
+	// 	glog.V(2).Infof("Bad CRC streak %d", numBadCRC)
+	// 	numBadCRC = 0
+	// }
+	var segmentID int
+	packetID := int(h & packetHeaderMask)
+	if packetID != m.Packet {
+		// glog.V(4).Infof("packet out of sync: packet id %d, state %+v\n%s", packetID, *m, hex.Dump(l))
+		m.Stats.numPacketOutOfSync++
+		m.ResetSync()
+		return false
+	}
+	if packetID < 20 {
+		segmentID = m.LastSegment + 1
+	} else if packetID == 20 {
+		if !verifyCRC(l) {
+			m.Stats.numBadCRC++
+			m.ResetSync()
+			return false
+		}
+		segmentID = int((h >> 12) & 0x7)
+		if segmentID != m.LastSegment+1 {
+			// glog.V(3).Infof("segment out of sync, segment id %d, state %+v\n%s", segmentID, *m, hex.Dump(l))
+			m.Stats.numSegmentOutOfSync++
+			m.ResetSync()
+			return false
+		}
+		m.LastSegment = segmentID
+	} else {
+		segmentID = m.LastSegment
+	}
+	numPacketsPerSegment := 60
+	if m.TelemetryEnabled {
+		numPacketsPerSegment++
+	}
+	packetOffset := (segmentID-1)*numPacketsPerSegment + packetID
+	if m.TelemetryEnabled {
+		if packetOffset == 0 {
+			// Parse the first row of telemetry data.
+			if err2 := f.Metadata.parseTelemetry(l[4:]); err2 != nil {
+				// glog.V(3).Infof("Failed to parse telemetry line: %v\n%s", err2, hex.Dump(l))
+				m.ResetSync()
+				return false
+			}
+		} else {
+			packetOffset -= 4
+		}
+	}
+	if 0 <= packetOffset && packetOffset < 240 {
+		// Image.
+		y := packetOffset / 2
+		xOffset := packetOffset % 2 * 80
+		// glog.V(2).Infof("saving to (%d, %d)\n%s", xOffset, y, hex.Dump(l))
+		for x := 0; x < 80; x++ {
+			o := 4 + x*2
+			f.SetIntensity14(x+xOffset, y, image14bit.Intensity14(internal.Big16.Uint16(l[o:o+2])))
+		}
+	}
+
+	m.Packet++
+	if m.Packet == numPacketsPerSegment {
+		glog.V(1).Info("segment ", m.LastSegment, " done")
+		if m.LastSegment == 4 {
+			elapsed := time.Now().Sub(m.Start)
+			glog.Infof("frame took %s, %g Mbps, %+v",
+				elapsed, float64(4*numPacketsPerSegment*164*8)/float64(elapsed.Microseconds()), m.Stats)
+			return true
+		}
+		m.Packet = 0
+	}
+	return false
+}
+
+var _ vospiStateMachine = &lepton3StateMachine{}
+
+// Resync tries to re-estalbish VOSPI sync.
+func (d *Dev) Resync() error {
+	pins, ok := d.s.(spi.Pins)
+	if !ok {
+		return errors.New("CS pin is not available")
+	}
+	cs := pins.CS()
+	if err := cs.Out(gpio.High); err != nil {
+		return fmt.Errorf("error in deasserting nCS: %s", err)
+	}
+	<-time.After(200 * time.Millisecond)
+	if err := cs.Out(gpio.Low); err != nil {
+		return fmt.Errorf("error in re-asserting nCS: %s", err)
+	}
+	return nil
 }
 
 // readFrame reads one frame.
@@ -225,9 +447,8 @@ func (d *Dev) readFrame(f *Frame) error {
 	}()
 
 	timeout := time.After(d.delay)
-	w := f.Bounds().Dx()
-	sync := 0
-	discard := 0
+	d.m.Reset()
+	n := 0
 	for {
 		select {
 		case <-timeout:
@@ -237,43 +458,9 @@ func (d *Dev) readFrame(f *Frame) error {
 				wg.Wait()
 				return err
 			}
-			h := internal.Big16.Uint16(l)
-			if h&packetHeaderDiscard == packetHeaderDiscard {
-				discard++
-				sync = 0
-				continue
-			}
-			headerID := h & packetHeaderMask
-			if discard != 0 {
-				//log.Printf("discarded %d", discard)
-				discard = 0
-				sync = 0
-			}
-			if int(headerID) == 0 && sync == 0 && !verifyCRC(l) {
-				//log.Printf("no crc")
-				sync = 0
-				continue
-			}
-			if int(headerID) != sync {
-				//log.Printf("%d != %d", headerID, sync)
-				sync = 0
-				continue
-			}
-			if sync == 0 {
-				// Parse the first row of telemetry data.
-				if err2 := f.Metadata.parseTelemetry(l[4:]); err2 != nil {
-					//log.Printf("Failed to parse telemetry line: %v", err2)
-					continue
-				}
-			} else if sync >= 3 {
-				// Image.
-				for x := 0; x < w; x++ {
-					o := 4 + x*2
-					f.SetIntensity14(x, sync-3, image14bit.Intensity14(internal.Big16.Uint16(l[o:o+2])))
-				}
-			}
-			if sync++; sync == d.frameLines {
-				// Last line, done.
+			n++
+			if d.m.Transition(l, f) {
+				glog.Infof("new frame after %d packets", n)
 				return nil
 			}
 		}
@@ -430,7 +617,7 @@ type telemetryRowA struct {
 func verifyCRC(d []byte) bool {
 	tmp := make([]byte, len(d))
 	copy(tmp, d)
-	tmp[0] &^= 0x0F
+	tmp[0] &= 0x0F
 	tmp[2] = 0
 	tmp[3] = 0
 	return internal.CRC16(tmp) == internal.Big16.Uint16(d[2:])

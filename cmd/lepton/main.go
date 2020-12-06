@@ -314,6 +314,11 @@ func query(dev *lepton.Dev) error {
 	}
 	fmt.Printf("Status.CameraStatus:             %s\n", status.CameraStatus)
 	fmt.Printf("Status.CommandCount:             %d\n", status.CommandCount)
+	version, err := dev.GetVersion()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Version:                         %s\n", version)
 	serial, err := dev.GetSerial()
 	if err != nil {
 		return err
@@ -372,6 +377,9 @@ func grabFrame(dev *lepton.Dev, path string, meta bool) error {
 		fmt.Printf("FFCDesired:   %t\n", frame.Metadata.FFCDesired)
 		fmt.Printf("Overtemp:     %t\n", frame.Metadata.Overtemp)
 	}
+	if len(path) == 0 {
+		return nil
+	}
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -391,7 +399,8 @@ func mainImpl() error {
 	meta := flag.Bool("meta", false, "print metadata")
 	output := flag.String("o", "", "PNG file to save")
 	ffc := flag.Bool("ffc", false, "trigger a calibration")
-	verbose := flag.Bool("v", false, "verbose mode")
+	verbose := flag.Bool("verbose", false, "verbose mode")
+	n := flag.Int("n", 0, "Number of frames to grab")
 	flag.Parse()
 	if !*verbose {
 		log.SetOutput(ioutil.Discard)
@@ -441,6 +450,11 @@ func mainImpl() error {
 	// Action.
 	if *ffc {
 		return dev.RunFFC()
+	}
+	for i := 0; i < *n; i++ {
+		if err := grabFrame(dev /*no output*/, "" /*meta*/, true); err != nil {
+			return fmt.Errorf("error when grabing frame %d: %s", i, err)
+		}
 	}
 	if hasOutput {
 		return grabFrame(dev, *output, *meta)

@@ -158,6 +158,43 @@ func TestGetSerial_fail(t *testing.T) {
 	}
 }
 
+func TestGetVersion(t *testing.T) {
+	for _, i := range []struct{ PartNumber, Version string }{
+		{"500-0659-01", "2.0"}, {"500-0763-01", "2.5"},
+		{"500-0726-01", "3.0"}, {"500-0771-01", "3.5"}} {
+		var data [32]byte
+		copy(data[:], i.PartNumber)
+		// Flip byte order.
+		for j := 0; j < 32; j += 2 {
+			data[j], data[j+1] = data[j+1], data[j]
+		}
+		bus, d := getDev(getOps([]byte{0x0, 0x4, 0x48, 0x1c}, data[:]))
+		if version, err := d.GetVersion(); err != nil {
+			t.Fatal(err)
+		} else if version.String() != i.Version {
+			t.Fatal("expected version = ", i.Version, ", got", version)
+		}
+		if err := bus.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestGetVersion_fail(t *testing.T) {
+	if _, err := getDevFail().GetVersion(); err == nil {
+		t.Fatal("failed")
+	}
+
+	// Unsupported part number.
+	var data [32]byte
+	copy(data[:], "abc")
+	bus, d := getDev(getOps([]byte{0x0, 0x4, 0x48, 0x1c}, data[:]))
+	defer bus.Close()
+	if _, err := d.GetVersion(); err == nil {
+		t.Fatal("failed")
+	}
+}
+
 func TestGetUptime(t *testing.T) {
 	bus, d := getDev(getOps([]byte{0x0, 0x4, 0x2, 0xc}, []byte{0, 0, 0, 0}))
 	if _, err := d.GetUptime(); err != nil {

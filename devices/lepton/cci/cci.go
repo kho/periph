@@ -146,6 +146,21 @@ func New(i i2c.Bus) (*Dev, error) {
 	}
 }
 
+// HardwareVersion describes the hardware version of the camera (e.g. 2.0, 2.5, 3.0, 3.5).
+type HardwareVersion struct {
+	Major uint8
+	Minor uint8
+}
+
+// Known returns if the hardware version is known.
+func (v HardwareVersion) Known() bool {
+	return v.Major != 0
+}
+
+func (v HardwareVersion) String() string {
+	return fmt.Sprint(v.Major, ".", v.Minor)
+}
+
 // Dev is the Lepton specific Command and Control Interface (CCI).
 //
 //
@@ -156,8 +171,9 @@ func New(i i2c.Bus) (*Dev, error) {
 //
 // Maximum I²C speed is 1Mhz.
 type Dev struct {
-	c      cciConn
-	serial uint64
+	c       cciConn
+	serial  uint64
+	version HardwareVersion
 }
 
 // String implements conn.Resource.
@@ -181,7 +197,7 @@ func (d *Dev) Init() error {
 	}
 	// Setup telemetry to always be as the header. There's no reason to make this
 	// configurable by the user.
-	if err := d.c.set(sysTelemetryEnable, internal.Enabled); err != nil {
+	if err := d.c.set(sysTelemetryEnable, internal.Disabled); err != nil {
 		return err
 	}
 	if err := d.c.set(sysTelemetryLocation, internal.Header); err != nil {
@@ -240,6 +256,43 @@ func (d *Dev) GetSerial() (uint64, error) {
 		d.serial = out
 	}
 	return d.serial, nil
+}
+
+// GetVersion returns the FLIR Lepton hardware version.
+func (d *Dev) GetVersion() (HardwareVersion, error) {
+	if !d.version.Known() {
+		var buf [32]byte
+		if err := d.c.get(oemPartNumber, &buf); err != nil {
+			return HardwareVersion{}, err
+		}
+		// Fix byte order. Oddly this is little endian.
+		for i := 0; i < 32; i += 2 {
+			buf[i], buf[i+1] = buf[i+1], buf[i]
+		}
+		// Convert the NUL-terminated buf into a string
+		l := 32
+		for i, c := range buf {
+			if c == 0 {
+				l = i
+				break
+			}
+		}
+		partNumber := string(buf[:l])
+		// Part numbers are listed on https://lepton.flir.com.
+		switch partNumber {
+		case "500-0659-01":
+			d.version = HardwareVersion{Major: 2, Minor: 0}
+		case "500-0763-01":
+			d.version = HardwareVersion{Major: 2, Minor: 5}
+		case "500-0726-01":
+			d.version = HardwareVersion{Major: 3, Minor: 0}
+		case "500-0771-01":
+			d.version = HardwareVersion{Major: 3, Minor: 5}
+		default:
+			return HardwareVersion{}, fmt.Errorf("unsupported part number: %q", partNumber)
+		}
+	}
+	return d.version, nil
 }
 
 // GetUptime returns the uptime. Rolls over after 1193 hours.
